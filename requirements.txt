@@ -1,5 +1,7 @@
 timm==0.4.12
-transformers==4.8.1
+transformers==4.44.2
+sentencepiece==0.1.99
+tokenizers==0.19.1
 Pillow==8.3.2
 numpy==1.21.1
 opencv-python==4.5.5.62

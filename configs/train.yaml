@@ -1,6 +1,16 @@
 train_file: ["../../datasets/DGM4/metadata/train.json"]
-val_file: ["../../datasets/DGM4/metadata/val.json"]           
-bert_config: 'configs/config_bert.json'
+val_file: ["../../datasets/DGM4/metadata/val.json"]
+# Switch the text encoder. The three lines below MUST agree; HAMMER will
+# refuse to construct otherwise.
+#   text_backbone: deberta  ->  text_config: configs/config_deberta.json
+#                              --text_encoder microsoft/deberta-v3-base
+#   text_backbone: bert     ->  text_config: configs/config_bert.json
+#                              --text_encoder bert-base-uncased
+text_backbone: deberta
+text_config: 'configs/config_deberta.json'
+# Lowercasing should match the encoder casing assumption. Leave unset to
+# auto-derive from text_backbone (true for bert, false for deberta).
+# text_lowercase: false
 
 image_res: 256
 vision_width: 768

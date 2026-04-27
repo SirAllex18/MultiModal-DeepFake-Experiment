@@ -29,13 +29,23 @@ from torch.nn import CrossEntropyLoss, MSELoss
 import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
-from transformers.file_utils import (
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    replace_return_docstrings,
-)
+
+try:
+    from transformers.utils import (
+        ModelOutput,
+        add_code_sample_docstrings,
+        add_start_docstrings,
+        add_start_docstrings_to_model_forward,
+        replace_return_docstrings,
+    )
+except ImportError:  # pragma: no cover - legacy transformers <4.20.
+    from transformers.file_utils import (
+        ModelOutput,
+        add_code_sample_docstrings,
+        add_start_docstrings,
+        add_start_docstrings_to_model_forward,
+        replace_return_docstrings,
+    )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,

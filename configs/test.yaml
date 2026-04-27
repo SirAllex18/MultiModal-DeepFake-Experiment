@@ -1,6 +1,12 @@
 train_file: ["../../datasets/DGM4/metadata/train.json"]
-val_file: ["../../datasets/DGM4/metadata/test.json"]     
-bert_config: 'configs/config_bert.json'
+val_file: ["../../datasets/DGM4/metadata/test.json"]
+# Must match what the checkpoint was trained with. The two lines below are
+# cross-checked at construction time; mismatched pairs raise a ValueError.
+#   text_backbone: deberta  ->  text_config: configs/config_deberta.json
+#   text_backbone: bert     ->  text_config: configs/config_bert.json
+text_backbone: deberta
+text_config: 'configs/config_deberta.json'
+# text_lowercase: false  # auto-derived from text_backbone if omitted
 
 image_res: 256
 vision_width: 768

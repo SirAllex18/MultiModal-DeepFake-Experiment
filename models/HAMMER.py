@@ -1,10 +1,29 @@
 from functools import partial
 from models.vit import VisionTransformer, interpolate_pos_embed
-from models.xbert import BertConfig, BertForMaskedLM, BertForTokenClassification
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+def _resolve_text_backbone(name):
+    """Return ``(ConfigClass, ModelClass)`` for the requested text backbone.
+
+    Imports are done lazily so that swapping backbones never forces the user
+    to keep both code paths importable at the same time (e.g. an
+    ``xbert.py`` that is incompatible with the installed ``transformers``
+    version stays harmless until the user actually selects ``bert``).
+    """
+    name = (name or "deberta").lower()
+    if name == "deberta":
+        from models.xdeberta import DebertaV2Config, DebertaV2ForTokenClassification
+        return DebertaV2Config, DebertaV2ForTokenClassification
+    if name == "bert":
+        from models.xbert import BertConfig, BertForTokenClassification
+        return BertConfig, BertForTokenClassification
+    raise ValueError(
+        f"Unknown text_backbone={name!r}. Expected 'bert' or 'deberta'."
+    )
 
 import numpy as np
 import random
@@ -41,12 +60,36 @@ class HAMMER(nn.Module):
             msg = self.visual_encoder.load_state_dict(state_dict,strict=False)
             print(msg)          
             
-        vision_width = config['vision_width']       
-        bert_config = BertConfig.from_json_file(config['bert_config'])
-        
-        self.text_encoder = BertForTokenClassification.from_pretrained(text_encoder, 
-                                                                    config=bert_config, 
-                                                                    label_smoothing=config['label_smoothing'])      
+        vision_width = config['vision_width']
+        # Path to a JSON config that overrides the upstream text-encoder
+        # config with HAMMER-specific fields ('fusion_layer', 'encoder_width').
+        text_cfg_path = config.get('text_config', config.get('bert_config'))
+        self.text_backbone = config.get('text_backbone', 'deberta').lower()
+        TextConfig, TextEncoderModel = _resolve_text_backbone(self.text_backbone)
+        text_config = TextConfig.from_json_file(text_cfg_path)
+
+        # Guard against the most common footgun: flipping ``text_backbone``
+        # in the YAML without remembering to flip ``text_config`` to match.
+        # The JSON files we ship advertise their architecture via the
+        # standard ``model_type`` field, so cross-check that here and fail
+        # loudly rather than producing a silently-misconfigured model.
+        expected_model_type = {'bert': 'bert', 'deberta': 'deberta-v2'}[self.text_backbone]
+        actual_model_type = getattr(text_config, 'model_type', None)
+        if actual_model_type != expected_model_type:
+            raise ValueError(
+                f"text_backbone={self.text_backbone!r} expects a config with "
+                f"model_type={expected_model_type!r}, but {text_cfg_path!r} "
+                f"declares model_type={actual_model_type!r}. "
+                "Fix the 'text_config' field in your YAML to match "
+                "'text_backbone' (configs/config_bert.json for bert, "
+                "configs/config_deberta.json for deberta)."
+            )
+
+        self.text_encoder = TextEncoderModel.from_pretrained(
+            text_encoder,
+            config=text_config,
+            label_smoothing=config['label_smoothing'],
+        )
 
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
@@ -70,24 +113,24 @@ class HAMMER(nn.Module):
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
         self.vision_proj_m = nn.Linear(vision_width, embed_dim)
-        self.text_encoder_m = BertForTokenClassification.from_pretrained(text_encoder, 
-                                                                    config=bert_config,
-                                                                    label_smoothing=config['label_smoothing'])       
-        self.text_proj_m = nn.Linear(text_width, embed_dim)    
-        
+        self.text_encoder_m = TextEncoderModel.from_pretrained(
+            text_encoder,
+            config=text_config,
+            label_smoothing=config['label_smoothing'],
+        )
+        self.text_proj_m = nn.Linear(text_width, embed_dim)
+
         self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
                             [self.vision_proj,self.vision_proj_m],
                             [self.text_encoder,self.text_encoder_m],
                             [self.text_proj,self.text_proj_m],
                            ]
-        
-        self.copy_params()
 
         # create the queue
         self.register_buffer("image_queue", torch.randn(embed_dim, self.queue_size))
         self.register_buffer("text_queue", torch.randn(embed_dim, self.queue_size))
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))  
-                             
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
         self.image_queue = nn.functional.normalize(self.image_queue, dim=0)
         self.text_queue = nn.functional.normalize(self.text_queue, dim=0)
 
@@ -99,7 +142,27 @@ class HAMMER(nn.Module):
         self.it_cross_attn = nn.MultiheadAttention(text_width, 12, dropout=0.0, batch_first=True)
 
         trunc_normal_(self.cls_token_local, std=.02)
-        self.apply(self._init_weights)
+        # Initialise only the modules HAMMER adds on top of the pretrained
+        # backbones. Applying the init globally (the original code did
+        # ``self.apply(self._init_weights)``) would clobber the DeBERTa
+        # weights we just loaded via ``from_pretrained`` and the DeiT weights
+        # loaded into the visual encoder. With DeBERTa swapped in for BERT
+        # there is no ALBEF checkpoint key prefix that would later restore
+        # the text encoder, so resetting it here is unrecoverable.
+        for module in (
+            self.vision_proj, self.text_proj,
+            self.itm_head, self.bbox_head, self.cls_head,
+            self.aggregator, self.it_cross_attn,
+            self.norm_layer_aggr, self.norm_layer_it_cross_atten,
+        ):
+            module.apply(self._init_weights)
+
+        # Synchronise momentum modules with their online counterparts AFTER
+        # all online modules have been initialised. Doing this before init
+        # lets the per-module ``apply(_init_weights)`` re-randomise online
+        # projections and leave the momentum copies stale, so step 0 of
+        # MoCo-style EMA targets disagrees with the online encoder.
+        self.copy_params()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

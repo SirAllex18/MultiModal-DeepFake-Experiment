@@ -21,7 +21,7 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 
 from models.vit import interpolate_pos_embed
-from transformers import BertTokenizerFast
+from transformers import AutoTokenizer
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
@@ -273,7 +273,12 @@ def main_worker(gpu, args, config):
 
 
     #### Model #### 
-    tokenizer = BertTokenizerFast.from_pretrained(args.text_encoder)
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder, use_fast=True)
+    if not getattr(tokenizer, 'is_fast', False):
+        raise ValueError(
+            "HAMMER requires a fast tokenizer because fake_text_pos labels "
+            "are aligned through BatchEncoding.word_ids()."
+        )
     if args.log:
         print(f"Creating MAMMER")
     model = HAMMER(args=args, config=config, text_encoder=args.text_encoder, tokenizer=tokenizer, init_deit=True)
@@ -363,7 +368,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', default='') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
-    parser.add_argument('--text_encoder', default='bert-base-uncased')
+    parser.add_argument('--text_encoder', default='microsoft/deberta-v3-base')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
     # parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    

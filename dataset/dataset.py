@@ -19,9 +19,9 @@ import random
 from random import random as rand
 
 class DGM4_Dataset(Dataset):
-    def __init__(self, config, ann_file, transform, max_words=30, is_train=True): 
-        
-        self.root_dir = '../../datasets'       
+    def __init__(self, config, ann_file, transform, max_words=30, is_train=True):
+
+        self.root_dir = '../../datasets'
         self.ann = []
         for f in ann_file:
             self.ann += json.load(open(f,'r'))
@@ -31,6 +31,15 @@ class DGM4_Dataset(Dataset):
         self.transform = transform
         self.max_words = max_words
         self.image_res = config['image_res']
+
+        # Lowercasing should match the text-encoder casing assumption.
+        # ``bert-base-uncased`` expects lowercase; ``microsoft/deberta-v3-base``
+        # is case-sensitive and benefits from preserving entity casing.
+        # Default tracks the text_backbone if 'text_lowercase' is not given.
+        if 'text_lowercase' in config:
+            self.lowercase = bool(config['text_lowercase'])
+        else:
+            self.lowercase = config.get('text_backbone', 'deberta').lower() == 'bert'
 
         self.is_train = is_train
         
@@ -93,7 +102,7 @@ class DGM4_Dataset(Dataset):
                         dtype=torch.float)
 
         label = ann['fake_cls']
-        caption = pre_caption(ann['text'], self.max_words)
+        caption = pre_caption(ann['text'], self.max_words, lowercase=self.lowercase)
         fake_text_pos = ann['fake_text_pos']
 
         fake_text_pos_list = torch.zeros(self.max_words)
