@@ -13,6 +13,7 @@ import time
 import datetime
 import json
 from pathlib import Path
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -65,6 +66,24 @@ def setlogger(log_file):
     return logger
 
 
+def _config_bool(value):
+    if isinstance(value, str):
+        return value.lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
+
+
+def get_amp_settings(config, device):
+    device_type = device.type if isinstance(device, torch.device) else torch.device(device).type
+    amp_enabled = _config_bool(config.get('amp', False)) and device_type == 'cuda'
+    amp_dtype_name = str(config.get('amp_dtype', 'fp16')).lower()
+
+    if amp_dtype_name in ('fp16', 'float16', 'half'):
+        return amp_enabled, torch.float16, True
+    if amp_dtype_name in ('bf16', 'bfloat16'):
+        return amp_enabled, torch.bfloat16, False
+    raise ValueError("amp_dtype must be 'fp16' or 'bf16'")
+
+
 def text_input_adjust(text_input, fake_word_pos, device):
     # input_ids adaptation
     input_ids_remove_SEP = [x[:-1] for x in text_input.input_ids]
@@ -96,7 +115,7 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler):
     # train
     model.train()  
     
@@ -120,36 +139,59 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
 
+    amp_enabled, amp_dtype, _ = get_amp_settings(config, device)
+
+    accum_steps = max(1, int(config.get('accum_steps', 1)))
+    num_iters = len(data_loader)
+
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
 
         if config['schedular']['sched'] == 'cosine_in_step':
-            scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
+            scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)
 
-        optimizer.zero_grad()
-  
-        image = image.to(device,non_blocking=True) 
-        
-        text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
-        
+        is_accum_boundary = ((i + 1) % accum_steps == 0) or ((i + 1) == num_iters)
+        if i % accum_steps == 0:
+            optimizer.zero_grad()
+
+        image = image.to(device, non_blocking=True)
+        fake_image_box = fake_image_box.to(device, non_blocking=True)
+
+        text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False)
+
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
- 
+
         if epoch>0:
             alpha = config['alpha']
         else:
-            alpha = config['alpha']*min(1,i/len(data_loader)) 
-        
-        loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)  
-            
-        loss = config['loss_MAC_wgt']*loss_MAC \
-             + config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_TMG_wgt']*loss_TMG \
-             + config['loss_MLC_wgt']*loss_MLC \
-          
-        loss.backward()
-        optimizer.step()    
-        
+            alpha = config['alpha']*min(1,i/len(data_loader))
+
+        sync_context = model.no_sync() if (args.distributed and not is_accum_boundary) else nullcontext()
+        with sync_context:
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)
+
+                loss = config['loss_MAC_wgt']*loss_MAC \
+                     + config['loss_BIC_wgt']*loss_BIC \
+                     + config['loss_bbox_wgt']*loss_bbox \
+                     + config['loss_giou_wgt']*loss_giou \
+                     + config['loss_TMG_wgt']*loss_TMG \
+                     + config['loss_MLC_wgt']*loss_MLC
+
+            window_start = (i // accum_steps) * accum_steps
+            group_size = min(accum_steps, num_iters - window_start)
+            scaled_loss = loss / group_size
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+        if is_accum_boundary:
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
         metric_logger.update(loss_MAC=loss_MAC.item())
         metric_logger.update(loss_BIC=loss_BIC.item())
         metric_logger.update(loss_bbox=loss_bbox.item())
@@ -211,6 +253,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
+    amp_enabled, amp_dtype, _ = get_amp_settings(config, device)
 
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
         
@@ -220,7 +263,8 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
+        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -385,6 +429,20 @@ def main_worker(gpu, args, config):
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
     if config['schedular']['sched'] == 'cosine_in_step':
         args.lr = config['optimizer']['lr']
+
+    amp_enabled, amp_dtype, use_grad_scaler = get_amp_settings(config, device)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and use_grad_scaler)
+    eval_interval = int(config.get('eval_interval', 1))
+    if eval_interval < 1:
+        raise ValueError("eval_interval must be >= 1")
+    accum_steps = max(1, int(config.get('accum_steps', 1)))
+    if args.log:
+        amp_name = str(config.get('amp_dtype', 'fp16')).lower()
+        eff_batch = config['batch_size_train'] * accum_steps * max(1, args.world_size)
+        print(f"AMP: enabled={amp_enabled}, dtype={amp_name}, grad_scaler={scaler.is_enabled()}")
+        print(f"Batch: micro={config['batch_size_train']} x accum={accum_steps} x world={max(1, args.world_size)} "
+              f"-> effective={eff_batch}")
+        print(f"Evaluation interval: every {eval_interval} epoch(s), always including the final epoch")
     
     if args.checkpoint:    
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
@@ -392,6 +450,8 @@ def main_worker(gpu, args, config):
         if args.resume:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            if scaler.is_enabled() and 'scaler' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler'])
             start_epoch = checkpoint['epoch']+1         
         else:
             pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)   
@@ -413,77 +473,82 @@ def main_worker(gpu, args, config):
     start_time = time.time()
 
     for epoch in range(start_epoch, max_epoch):
-            
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
-        AUC_cls, ACC_cls, EER_cls, \
-        MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
-        IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-        ACC_tok, Precision_tok, Recall_tok, F1_tok \
-        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
 
-        #============ tensorboard train log info ============#
-        if args.log:
-            lossinfo = {
-                'AUC_cls': round(AUC_cls*100, 4),                                                                                                  
-                'ACC_cls': round(ACC_cls*100, 4),                                                                                                  
-                'EER_cls': round(EER_cls*100, 4),                                                                                                  
-                'MAP': round(MAP*100, 4),                                                                                                  
-                'OP': round(OP*100, 4),                                                                                                  
-                'OR': round(OR*100, 4), 
-                'OF1': round(OF1*100, 4), 
-                'CP': round(CP*100, 4), 
-                'CR': round(CR*100, 4), 
-                'CF1': round(CF1*100, 4), 
-                'OP_k': round(OP_k*100, 4), 
-                'OR_k': round(OR_k*100, 4), 
-                'OF1_k': round(OF1_k*100, 4), 
-                'CP_k': round(CP_k*100, 4), 
-                'CR_k': round(CR_k*100, 4), 
-                'CF1_k': round(CF1_k*100, 4), 
-                'IOU_score': round(IOU_score*100, 4),                                                                                                  
-                'IOU_ACC_50': round(IOU_ACC_50*100, 4),                                                                                                  
-                'IOU_ACC_75': round(IOU_ACC_75*100, 4),                                                                                                  
-                'IOU_ACC_95': round(IOU_ACC_95*100, 4),                                                                                                  
-                'ACC_tok': round(ACC_tok*100, 4),                                                                                                  
-                'Precision_tok': round(Precision_tok*100, 4),                                                                                                  
-                'Recall_tok': round(Recall_tok*100, 4),                                                                                                  
-                'F1_tok': round(F1_tok*100, 4),                                                                                                  
-                    } 
-            for tag, value in lossinfo.items():
-                summary_writer.add_scalar(tag, value, epoch)
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, scaler)
+        should_eval = ((epoch + 1) % eval_interval == 0) or ((epoch + 1) == max_epoch)
+        val_stats = {}
 
-        #============ evaluation info ============#
-        val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
-                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
-                     "EER_cls": "{:.4f}".format(EER_cls*100),
-                     "MAP": "{:.4f}".format(MAP*100),
-                     "OP": "{:.4f}".format(OP*100),
-                     "OR": "{:.4f}".format(OR*100),
-                     "OF1": "{:.4f}".format(OF1*100),
-                     "CP": "{:.4f}".format(CP*100),
-                     "CR": "{:.4f}".format(CR*100),
-                     "CF1": "{:.4f}".format(CF1*100),
-                     "OP_k": "{:.4f}".format(OP_k*100),
-                     "OR_k": "{:.4f}".format(OR_k*100),
-                     "OF1_k": "{:.4f}".format(OF1_k*100),
-                     "CP_k": "{:.4f}".format(CP_k*100),
-                     "CR_k": "{:.4f}".format(CR_k*100),
-                     "CF1_k": "{:.4f}".format(CF1_k*100),
-                     "IOU_score": "{:.4f}".format(IOU_score*100),
-                     "IOU_ACC_50": "{:.4f}".format(IOU_ACC_50*100),
-                     "IOU_ACC_75": "{:.4f}".format(IOU_ACC_75*100),
-                     "IOU_ACC_95": "{:.4f}".format(IOU_ACC_95*100),
-                     "ACC_tok": "{:.4f}".format(ACC_tok*100),
-                     "Precision_tok": "{:.4f}".format(Precision_tok*100),
-                     "Recall_tok": "{:.4f}".format(Recall_tok*100),
-                     "F1_tok": "{:.4f}".format(F1_tok*100),
-        }
-        
-        if utils.is_main_process(): 
+        if should_eval:
+            AUC_cls, ACC_cls, EER_cls, \
+            MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
+            IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
+            ACC_tok, Precision_tok, Recall_tok, F1_tok \
+            = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+
+            #============ tensorboard train log info ============#
+            if args.log:
+                lossinfo = {
+                    'AUC_cls': round(AUC_cls*100, 4),
+                    'ACC_cls': round(ACC_cls*100, 4),
+                    'EER_cls': round(EER_cls*100, 4),
+                    'MAP': round(MAP*100, 4),
+                    'OP': round(OP*100, 4),
+                    'OR': round(OR*100, 4),
+                    'OF1': round(OF1*100, 4),
+                    'CP': round(CP*100, 4),
+                    'CR': round(CR*100, 4),
+                    'CF1': round(CF1*100, 4),
+                    'OP_k': round(OP_k*100, 4),
+                    'OR_k': round(OR_k*100, 4),
+                    'OF1_k': round(OF1_k*100, 4),
+                    'CP_k': round(CP_k*100, 4),
+                    'CR_k': round(CR_k*100, 4),
+                    'CF1_k': round(CF1_k*100, 4),
+                    'IOU_score': round(IOU_score*100, 4),
+                    'IOU_ACC_50': round(IOU_ACC_50*100, 4),
+                    'IOU_ACC_75': round(IOU_ACC_75*100, 4),
+                    'IOU_ACC_95': round(IOU_ACC_95*100, 4),
+                    'ACC_tok': round(ACC_tok*100, 4),
+                    'Precision_tok': round(Precision_tok*100, 4),
+                    'Recall_tok': round(Recall_tok*100, 4),
+                    'F1_tok': round(F1_tok*100, 4),
+                        }
+                for tag, value in lossinfo.items():
+                    summary_writer.add_scalar(tag, value, epoch)
+
+            #============ evaluation info ============#
+            val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
+                         "ACC_cls": "{:.4f}".format(ACC_cls*100),
+                         "EER_cls": "{:.4f}".format(EER_cls*100),
+                         "MAP": "{:.4f}".format(MAP*100),
+                         "OP": "{:.4f}".format(OP*100),
+                         "OR": "{:.4f}".format(OR*100),
+                         "OF1": "{:.4f}".format(OF1*100),
+                         "CP": "{:.4f}".format(CP*100),
+                         "CR": "{:.4f}".format(CR*100),
+                         "CF1": "{:.4f}".format(CF1*100),
+                         "OP_k": "{:.4f}".format(OP_k*100),
+                         "OR_k": "{:.4f}".format(OR_k*100),
+                         "OF1_k": "{:.4f}".format(OF1_k*100),
+                         "CP_k": "{:.4f}".format(CP_k*100),
+                         "CR_k": "{:.4f}".format(CR_k*100),
+                         "CF1_k": "{:.4f}".format(CF1_k*100),
+                         "IOU_score": "{:.4f}".format(IOU_score*100),
+                         "IOU_ACC_50": "{:.4f}".format(IOU_ACC_50*100),
+                         "IOU_ACC_75": "{:.4f}".format(IOU_ACC_75*100),
+                         "IOU_ACC_95": "{:.4f}".format(IOU_ACC_95*100),
+                         "ACC_tok": "{:.4f}".format(ACC_tok*100),
+                         "Precision_tok": "{:.4f}".format(Precision_tok*100),
+                         "Recall_tok": "{:.4f}".format(Recall_tok*100),
+                         "F1_tok": "{:.4f}".format(F1_tok*100),
+            }
+
+        if utils.is_main_process():
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                            **{f'val_{k}': v for k, v in val_stats.items()},
                             'epoch': epoch,
-                        }             
+                        }
+            if should_eval:
+                log_stats.update({f'val_{k}': v for k, v in val_stats.items()})
             with open(os.path.join(log_dir, "log.txt"),"a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -492,6 +557,7 @@ def main_worker(gpu, args, config):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'config': config,
                     'epoch': epoch,
                 }
@@ -500,19 +566,20 @@ def main_worker(gpu, args, config):
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr': optimizer.param_groups[0]["lr"],
+                    'scaler': scaler.state_dict(),
                     'config': config,
                     'epoch': epoch,
-                }                    
+                }
             if (epoch % args.model_save_epoch == 0 and epoch!=0):
-                torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch)) 
-            if float(val_stats['AUC_cls'])>best:
-                torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth')) 
+                torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))
+            if should_eval and float(val_stats['AUC_cls'])>best:
+                torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth'))
                 best = float(val_stats['AUC_cls'])
-                best_epoch = epoch 
+                best_epoch = epoch
 
         if config['schedular']['sched'] != 'cosine_in_step':
-            lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier() 
+            lr_scheduler.step(epoch+warmup_steps+1)
+        dist.barrier()
 
     if utils.is_main_process():
         torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))   

@@ -1,22 +1,23 @@
 train_file: ["../../datasets/DGM4/metadata/train.json"]
 val_file: ["../../datasets/DGM4/metadata/val.json"]
-# Switch the text encoder. The three lines below MUST agree; HAMMER will
-# refuse to construct otherwise.
+dataset_division: 2
+# Switch the text encoder.
 #   text_backbone: deberta  ->  text_config: configs/config_deberta.json
 #                              --text_encoder microsoft/deberta-v3-base
 #   text_backbone: bert     ->  text_config: configs/config_bert.json
 #                              --text_encoder bert-base-uncased
 text_backbone: deberta
 text_config: 'configs/config_deberta.json'
-# Lowercasing should match the encoder casing assumption. Leave unset to
-# auto-derive from text_backbone (true for bert, false for deberta).
-# text_lowercase: false
 
 image_res: 256
 vision_width: 768
 embed_dim: 256
-batch_size_train: 32
+batch_size_train: 16
 batch_size_val: 64
+accum_steps: 2
+amp: true
+amp_dtype: bf16
+eval_interval: 2
 temp: 0.07
 queue_size: 65536
 momentum: 0.995
@@ -32,7 +33,7 @@ loss_TMG_wgt: 1
 loss_MLC_wgt: 1
 
 optimizer: {opt: adamW, lr: 2e-5, lr_img: 1e-4, weight_decay: 0.02}
-schedular: {sched: cosine, lr: 2e-5, epochs: 50, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 10, cooldown_epochs: 0}
+schedular: {sched: cosine, lr: 2e-5, epochs: 20, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 4, cooldown_epochs: 0}
 
 
 
