@@ -75,6 +75,36 @@ pip install -r requirements.txt
 conda install -c conda-forge ruamel_yaml
 ```
 
+#### Running on newer GPUs (e.g. RTX 40-series / Ada, sm_89)
+The PyTorch 1.10.0 + CUDA 11.3 build above only supports older GPUs and will fail on
+an RTX 4080 with `CUDA error: no kernel image is available for execution on the device`.
+Ada Lovelace (`sm_89`) needs **PyTorch >= 2.0 with CUDA >= 11.8**, which is also required
+for the bf16 mixed-precision training used by the reduced-budget config. Keep Python 3.8
+(so the pinned `numpy`/`scipy` still have wheels and `requirements.txt` is unchanged) and
+swap only the torch install line:
+```
+conda create -n DGM4 python=3.8
+conda activate DGM4
+
+# Pick the CUDA build that matches the VM driver (cu118 / cu121 / cu124).
+pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+
+pip install -r requirements.txt
+conda install -c conda-forge ruamel_yaml
+```
+Do **not** upgrade `transformers` past the pinned `4.44.2` (with `tokenizers==0.19.1`):
+the BERT/DeBERTa text-encoder wrappers subclass Hugging Face internals that changed in
+transformers 5.x.
+
+Verify the install before training:
+```
+python -c "import torch; print(torch.cuda.get_device_capability())"   # expect (8, 9) on a 4080, no error
+python -c "import torch; print(torch.cuda.is_bf16_supported())"        # expect True (config uses amp_dtype: bf16)
+```
+If the VM forces Python >= 3.10, the pinned `numpy==1.21.1` / `scipy==1.8.0` have no wheels
+and must be relaxed to `numpy>=1.23,<2` and `scipy>=1.10` in `requirements.txt`. Stay on
+Python <= 3.11 regardless, since `dataset/dataset.py` imports `distutils` (removed in 3.12).
+
 
 ## Dataset Preparation
 
