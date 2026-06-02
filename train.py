@@ -6,7 +6,32 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
-import ruamel_yaml as yaml
+try:
+    import ruamel_yaml as yaml
+except ImportError:
+    from ruamel.yaml import YAML
+    import io
+
+    class _YamlCompat:
+        Loader = object
+
+        @staticmethod
+        def load(stream, Loader=None):
+            parser = YAML(typ="safe")
+            return parser.load(stream)
+
+        @staticmethod
+        def dump(data, stream=None, **kwargs):
+            dumper = YAML()
+
+            if stream is None:
+                buffer = io.StringIO()
+                dumper.dump(data, buffer)
+                return buffer.getvalue()
+
+            return dumper.dump(data, stream)
+
+    yaml = _YamlCompat()
 import numpy as np
 import random
 import time
