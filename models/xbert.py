@@ -46,6 +46,15 @@ except ImportError:  # pragma: no cover - legacy transformers <4.20.
         add_start_docstrings_to_model_forward,
         replace_return_docstrings,
     )
+
+# Compatibility shim for newer transformers versions where
+# add_code_sample_docstrings no longer accepts tokenizer_class.
+_hf_add_code_sample_docstrings = add_code_sample_docstrings
+
+def add_code_sample_docstrings(*args, **kwargs):
+    kwargs.pop("tokenizer_class", None)
+    return _hf_add_code_sample_docstrings(*args, **kwargs)
+
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,

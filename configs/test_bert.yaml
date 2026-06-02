@@ -1,12 +1,8 @@
 train_file: ["../../datasets/DGM4/metadata/train.json"]
 val_file: ["../../datasets/DGM4/metadata/test.json"]
-# Must match what the checkpoint was trained with. The two lines below are
-# cross-checked at construction time; mismatched pairs raise a ValueError.
-#   text_backbone: deberta  ->  text_config: configs/config_deberta.json
-#   text_backbone: bert     ->  text_config: configs/config_bert.json
-text_backbone: deberta
-text_config: 'configs/config_deberta.json'
-# text_lowercase: false  # auto-derived from text_backbone if omitted
+text_backbone: bert
+text_config: 'configs/config_bert.json'
+text_lowercase: true
 
 image_res: 256
 vision_width: 768
@@ -29,10 +25,3 @@ loss_MLC_wgt: 1
 
 optimizer: {opt: adamW, lr: 1e-4, weight_decay: 0.02}
 schedular: {sched: cosine, lr: 1e-4, epochs: 50, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 10, cooldown_epochs: 0}
-
-
-
-
-
-
-
