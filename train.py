@@ -9,22 +9,27 @@ import argparse
 try:
     import ruamel_yaml as yaml
 except ImportError:
-    from ruamel.yaml import YAML
+    try:
+        from ruamel.yaml import YAML
 
-    class _YamlCompat:
-        Loader = object
+        class _YamlCompat:
+            Loader = object
 
-        @staticmethod
-        def load(stream, Loader=None):
-            parser = YAML(typ="safe")
-            return parser.load(stream)
+            @staticmethod
+            def load(stream, Loader=None):
+                parser = YAML(typ="safe")
+                return parser.load(stream)
 
-        @staticmethod
-        def dump(data, stream):
-            dumper = YAML()
-            return dumper.dump(data, stream)
+            @staticmethod
+            def dump(data, stream):
+                dumper = YAML()
+                return dumper.dump(data, stream)
 
-    yaml = _YamlCompat()
+        yaml = _YamlCompat()
+    except ImportError:
+        # Last resort: PyYAML exposes a load(stream, Loader=...)/dump(data, stream)
+        # /Loader interface compatible with how this module uses `yaml`.
+        import yaml
 import numpy as np
 import random
 import time
@@ -133,6 +138,50 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
+def build_vlm_token_targets(text_input, word_scores, word_mask, token_dim, device):
+    """Map per-word VLM scores to BERT subword positions.
+
+    Mirrors ``text_input_adjust`` exactly: ``word_ids(i)[1:-1]`` gives the word
+    index for each content token (CLS/SEP excluded), and position ``p`` here
+    lines up with ``logits_tok[:, p]`` (the token head drops CLS via
+    ``sequence_output[:, 1:]``). Using the same convention guarantees the VLM
+    token targets are not shifted by one relative to HAMMER's own token labels.
+
+    Returns ``token_scores`` and ``token_mask`` of shape ``[B, token_dim]``
+    where ``token_dim == input_ids.shape[1] - 1``. Padding and words outside the
+    VLM word mask get mask 0.
+    """
+    B, max_words = word_scores.shape
+    token_scores = torch.zeros(B, token_dim, dtype=torch.float)
+    token_mask = torch.zeros(B, token_dim, dtype=torch.float)
+    for i in range(B):
+        subword_idx = text_input.word_ids(i)
+        content = subword_idx[1:-1]  # word id per content token (CLS/SEP removed)
+        for p, w in enumerate(content):
+            if p >= token_dim:
+                break
+            if w is None or w >= max_words:
+                continue
+            if word_mask[i, w] > 0:
+                token_scores[i, p] = word_scores[i, w]
+                token_mask[i, p] = 1.0
+    return token_scores.to(device), token_mask.to(device)
+
+
+def prepare_vlm_target(vlm_target, text_input, device):
+    """Move cache tensors to GPU and add word->subword token targets."""
+    token_dim = text_input.input_ids.shape[1] - 1  # CLS removed, matches logits_tok
+    token_scores, token_mask = build_vlm_token_targets(
+        text_input, vlm_target['word_scores'], vlm_target['word_mask'], token_dim, device)
+    return {
+        'valid': vlm_target['valid'].to(device, non_blocking=True),
+        'fake_prob': vlm_target['fake_prob'].to(device, non_blocking=True),
+        'multicls_probs': vlm_target['multicls_probs'].to(device, non_blocking=True),
+        'token_scores': token_scores,
+        'token_mask': token_mask,
+    }
+
+
 def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler):
     # train
     model.train()  
@@ -145,6 +194,11 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.add_meter('loss_giou', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_TMG', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_MLC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    vlm_distill = bool(config.get('vlm_distill', False))
+    if vlm_distill:
+        metric_logger.add_meter('loss_vlm_bic', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+        metric_logger.add_meter('loss_vlm_mlc', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+        metric_logger.add_meter('loss_vlm_tmg', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     
     header = 'Train Epoch: [{}]'.format(epoch)
@@ -162,7 +216,15 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     accum_steps = max(1, int(config.get('accum_steps', 1)))
     num_iters = len(data_loader)
 
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+    for i, batch in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+
+        # The training dataset appends an 8th element (vlm_target) only when
+        # vlm_distill is enabled; otherwise the batch is the original 7-tuple.
+        if vlm_distill:
+            image, label, text, fake_image_box, fake_word_pos, W, H, vlm_target = batch
+        else:
+            image, label, text, fake_image_box, fake_word_pos, W, H = batch
+            vlm_target = None
 
         if config['schedular']['sched'] == 'cosine_in_step':
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)
@@ -178,6 +240,9 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
 
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
+        if vlm_target is not None:
+            vlm_target = prepare_vlm_target(vlm_target, text_input, device)
+
         if epoch>0:
             alpha = config['alpha']
         else:
@@ -186,14 +251,20 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         sync_context = model.no_sync() if (args.distributed and not is_accum_boundary) else nullcontext()
         with sync_context:
             with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
-                loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)
+                loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, \
+                    loss_vlm_bic, loss_vlm_mlc, loss_vlm_tmg = model(
+                        image, label, text_input, fake_image_box, fake_token_pos,
+                        alpha=alpha, vlm_target=vlm_target)
 
                 loss = config['loss_MAC_wgt']*loss_MAC \
                      + config['loss_BIC_wgt']*loss_BIC \
                      + config['loss_bbox_wgt']*loss_bbox \
                      + config['loss_giou_wgt']*loss_giou \
                      + config['loss_TMG_wgt']*loss_TMG \
-                     + config['loss_MLC_wgt']*loss_MLC
+                     + config['loss_MLC_wgt']*loss_MLC \
+                     + config.get('loss_vlm_bic_wgt', 0.0)*loss_vlm_bic \
+                     + config.get('loss_vlm_mlc_wgt', 0.0)*loss_vlm_mlc \
+                     + config.get('loss_vlm_tmg_wgt', 0.0)*loss_vlm_tmg
 
             window_start = (i // accum_steps) * accum_steps
             group_size = min(accum_steps, num_iters - window_start)
@@ -216,8 +287,12 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(loss_giou=loss_giou.item())
         metric_logger.update(loss_TMG=loss_TMG.item())
         metric_logger.update(loss_MLC=loss_MLC.item())
+        if vlm_distill:
+            metric_logger.update(loss_vlm_bic=loss_vlm_bic.item())
+            metric_logger.update(loss_vlm_mlc=loss_vlm_mlc.item())
+            metric_logger.update(loss_vlm_tmg=loss_vlm_tmg.item())
         metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         
         if epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step': 
             scheduler.step(i//step_size)   
@@ -233,10 +308,14 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
                 'loss_BIC': loss_BIC.item(),                                                                                                  
                 'loss_bbox': loss_bbox.item(),                                                                                                  
                 'loss_giou': loss_giou.item(),                                                                                                  
-                'loss_TMG': loss_TMG.item(),                                                                                                  
-                'loss_MLC': loss_MLC.item(),                                                                                                  
-                'loss': loss.item(),                                                                                                  
-                    } 
+                'loss_TMG': loss_TMG.item(),
+                'loss_MLC': loss_MLC.item(),
+                'loss': loss.item(),
+                    }
+            if vlm_distill:
+                lossinfo['loss_vlm_bic'] = loss_vlm_bic.item()
+                lossinfo['loss_vlm_mlc'] = loss_vlm_mlc.item()
+                lossinfo['loss_vlm_tmg'] = loss_vlm_tmg.item()
             for tag, value in lossinfo.items():
                 summary_writer.add_scalar(tag, value, global_step)
         

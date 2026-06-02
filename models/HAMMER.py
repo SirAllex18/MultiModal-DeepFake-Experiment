@@ -30,6 +30,7 @@ import random
 
 from models import box_ops
 from tools.multilabel_metrics import get_multi_label
+from dataset.vlm_cache import MANIP_CLASSES
 from timm.models.layers import trunc_normal_
 
 class HAMMER(nn.Module):
@@ -107,6 +108,19 @@ class HAMMER(nn.Module):
 
         # creat multi-cls head
         self.cls_head = self.build_mlp(input_dim=text_width, output_dim=4)
+
+        # ---- VLM distillation config ----
+        # Soft-label temperature for the optional binary KL term, and the
+        # per-class weight that restricts multi-label distillation to the
+        # classes the VLM is actually informative about (text_swap /
+        # text_attribute by default; face_* are forensic and down-weighted to
+        # 0). Registered as a buffer so it follows the model to the GPU.
+        self.vlm_teacher_T = float(config.get('vlm_teacher_temperature', 1.0))
+        mlc_classes = config.get('vlm_mlc_use_classes', ['text_swap', 'text_attribute'])
+        self.register_buffer(
+            'vlm_mlc_class_weight',
+            torch.tensor([1.0 if c in mlc_classes else 0.0 for c in MANIP_CLASSES]),
+        )
 
         # create momentum models
         self.visual_encoder_m = VisionTransformer(
@@ -213,7 +227,8 @@ class HAMMER(nn.Module):
 
         return loss_bbox.sum() / num_boxes, loss_giou.sum() / num_boxes
 
-    def forward(self, image, label, text, fake_image_box, fake_text_pos, alpha=0, is_train=True):
+    def forward(self, image, label, text, fake_image_box, fake_text_pos, alpha=0, is_train=True,
+                vlm_target=None):
         if is_train:
             with torch.no_grad():
                 self.temp.clamp_(0.001,0.5)
@@ -354,7 +369,20 @@ class HAMMER(nn.Module):
 
             loss_TMG = token_cls_output.loss
 
-            return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC
+            ##================= VLM distillation ========================##
+            # Auxiliary soft targets from the offline VLM cache. Each term is
+            # masked by per-sample cache validity, so uncached/failed samples
+            # contribute nothing. Inference is unaffected (this branch is
+            # train-only and `vlm_target` is None for the baseline).
+            if vlm_target is not None:
+                loss_vlm_bic, loss_vlm_mlc, loss_vlm_tmg = self.compute_vlm_losses(
+                    vl_output, output_cls, token_cls_output.logits, vlm_target)
+            else:
+                z = torch.zeros((), device=image.device)
+                loss_vlm_bic = loss_vlm_mlc = loss_vlm_tmg = z
+
+            return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC, \
+                   loss_vlm_bic, loss_vlm_mlc, loss_vlm_tmg
 
         else:
             image_embeds = self.visual_encoder(image) 
@@ -401,10 +429,63 @@ class HAMMER(nn.Module):
                                         return_dict = True,
                                         return_logits = True,   
                                         )     
-            return logits_real_fake, logits_multicls, output_coord, logits_tok   
+            return logits_real_fake, logits_multicls, output_coord, logits_tok
 
 
-    @torch.no_grad()    
+    def compute_vlm_losses(self, bic_logits, mlc_logits, token_logits, vlm_target):
+        """Masked VLM distillation losses.
+
+        Args:
+            bic_logits:   [B, 2]   HAMMER real/fake (ITM) logits.
+            mlc_logits:   [B, 4]   HAMMER manipulation-type logits (FS,FA,TS,TA).
+            token_logits: [B, L, 2] per-token grounding logits (CLS already removed).
+            vlm_target:   dict of batched tensors. Requires 'valid' [B],
+                          'fake_prob' [B], 'multicls_probs' [B,4]; token terms
+                          require 'token_scores' [B,L] and 'token_mask' [B,L]
+                          (added by train.py after word->subword mapping).
+
+        Each term is averaged only over valid (and, for tokens, masked)
+        elements, with a clamped denominator so an all-invalid batch yields a
+        finite zero instead of NaN. Logits are upcast to fp32 for numerically
+        stable soft-target losses under bf16/fp16 autocast.
+        """
+        device = bic_logits.device
+        valid = vlm_target['valid'].to(device).float().view(-1)          # [B]
+        nv = valid.sum().clamp_min(1.0)
+
+        # ---- binary KL distillation (optional; usually weight 0) ----
+        T = self.vlm_teacher_T
+        p = vlm_target['fake_prob'].to(device).float().clamp(0.0, 1.0).view(-1)  # [B]
+        teacher = torch.stack([1.0 - p, p], dim=1)                       # [B,2]
+        log_student = F.log_softmax(bic_logits.float() / T, dim=1)
+        kl = F.kl_div(log_student, teacher, reduction='none').sum(dim=1)  # [B]
+        loss_vlm_bic = (kl * valid).sum() / nv * (T * T)
+
+        # ---- multi-label BCE distillation (class-weighted to TS/TA) ----
+        probs = vlm_target['multicls_probs'].to(device).float()          # [B,4]
+        cw = self.vlm_mlc_class_weight.to(device).view(1, -1)            # [1,4]
+        bce = F.binary_cross_entropy_with_logits(
+            mlc_logits.float(), probs, reduction='none') * cw            # [B,4]
+        denom_mlc = (nv * cw.sum()).clamp_min(1.0)
+        loss_vlm_mlc = (bce * valid.view(-1, 1)).sum() / denom_mlc
+
+        # ---- token grounding BCE distillation ----
+        if 'token_scores' in vlm_target and 'token_mask' in vlm_target:
+            token_scores = vlm_target['token_scores'].to(device).float()  # [B,L]
+            token_mask = vlm_target['token_mask'].to(device).float()      # [B,L]
+            token_mask = token_mask * valid.view(-1, 1)                   # gate by validity
+            # class1 = manipulated; reduce the 2-way head to a scalar fake logit.
+            token_fake_logit = (token_logits[..., 1] - token_logits[..., 0]).float()  # [B,L]
+            tbce = F.binary_cross_entropy_with_logits(
+                token_fake_logit, token_scores, reduction='none')        # [B,L]
+            loss_vlm_tmg = (tbce * token_mask).sum() / token_mask.sum().clamp_min(1.0)
+        else:
+            loss_vlm_tmg = torch.zeros((), device=device)
+
+        return loss_vlm_bic, loss_vlm_mlc, loss_vlm_tmg
+
+
+    @torch.no_grad()
     def copy_params(self):
         for model_pair in self.model_pairs:           
             for param, param_m in zip(model_pair[0].parameters(), model_pair[1].parameters()):

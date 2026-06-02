@@ -8,22 +8,27 @@ import argparse
 try:
     import ruamel_yaml as yaml
 except ImportError:
-    from ruamel.yaml import YAML
+    try:
+        from ruamel.yaml import YAML
 
-    class _YamlCompat:
-        Loader = object
+        class _YamlCompat:
+            Loader = object
 
-        @staticmethod
-        def load(stream, Loader=None):
-            parser = YAML(typ="safe")
-            return parser.load(stream)
+            @staticmethod
+            def load(stream, Loader=None):
+                parser = YAML(typ="safe")
+                return parser.load(stream)
 
-        @staticmethod
-        def dump(data, stream):
-            dumper = YAML()
-            return dumper.dump(data, stream)
+            @staticmethod
+            def dump(data, stream):
+                dumper = YAML()
+                return dumper.dump(data, stream)
 
-    yaml = _YamlCompat()
+        yaml = _YamlCompat()
+    except ImportError:
+        # Last resort: PyYAML exposes a load(stream, Loader=...)/dump(data, stream)
+        # /Loader interface compatible with how this module uses `yaml`.
+        import yaml
 import numpy as np
 import random
 import time

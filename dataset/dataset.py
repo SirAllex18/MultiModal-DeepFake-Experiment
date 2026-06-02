@@ -21,7 +21,10 @@ from random import random as rand
 class DGM4_Dataset(Dataset):
     def __init__(self, config, ann_file, transform, max_words=30, is_train=True):
 
-        self.root_dir = '../../datasets'
+        # Image root that ann['image'] paths are relative to. Configurable so the
+        # same metadata can be used wherever DGM4 lives; defaults to the layout
+        # described in the README ('../../datasets').
+        self.root_dir = config.get('image_root', '../../datasets')
         self.ann = []
         for f in ann_file:
             self.ann += json.load(open(f,'r'))
@@ -42,7 +45,20 @@ class DGM4_Dataset(Dataset):
             self.lowercase = config.get('text_backbone', 'deberta').lower() == 'bert'
 
         self.is_train = is_train
-        
+
+        # ---- VLM distillation cache (training split only) ----
+        # The VLM provides auxiliary soft targets during training only; the
+        # evaluation/test path never consumes them, so we attach the 8th
+        # return value strictly to the training dataset. When disabled the
+        # dataset returns the original 7-tuple, byte-for-byte unchanged.
+        self.vlm_enabled = bool(config.get('vlm_distill', False)) and is_train
+        self.vlm_cache = None
+        if self.vlm_enabled:
+            from dataset.vlm_cache import VLMCache
+            self.vlm_cache = VLMCache(
+                config.get('vlm_cache_file'), max_words=self.max_words, verbose=True
+            )
+
     def __len__(self):
         return len(self.ann)
 
@@ -110,6 +126,11 @@ class DGM4_Dataset(Dataset):
         for i in fake_text_pos:
             if i<self.max_words:
                 fake_text_pos_list[i]=1
-        
-                
+
+        if self.vlm_enabled:
+            # caption is the exact pre_caption() string the text encoder sees,
+            # so its sha1 matches the offline cache key.
+            vlm_target = self.vlm_cache.build_target(img_dir, caption)
+            return image, label, caption, fake_image_box, fake_text_pos_list, W, H, vlm_target
+
         return image, label, caption, fake_image_box, fake_text_pos_list, W, H

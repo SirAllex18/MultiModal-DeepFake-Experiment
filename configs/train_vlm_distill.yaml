@@ -1,0 +1,62 @@
+# HAMMER + VLM distillation — TRAIN config (BERT text encoder).
+#
+# Baseline-to-beat is the BERT run in results_all_bert.txt, so this experiment
+# uses the BERT backbone (NOT deberta). Run with:
+#   --text_encoder bert-base-uncased
+#
+# Three-way comparison (keep EVERYTHING else identical for a fair result):
+#   E0 baseline : set  vlm_distill: false   (no cache needed)
+#   E1 MLC only : vlm_distill: true, loss_vlm_mlc_wgt: 0.05, loss_vlm_tmg_wgt: 0.0
+#   E2 MLC+TMG  : vlm_distill: true, loss_vlm_mlc_wgt: 0.05, loss_vlm_tmg_wgt: 0.10  (as below)
+#
+# The VLM cache MUST have been built with the SAME max_words (50) and lowercase
+# (true, because bert-base-uncased is uncased) — see tools/build_vlm_cache.py.
+
+train_file: ["../../datasets/DGM4/metadata/train.json"]
+val_file: ["../../datasets/DGM4/metadata/val.json"]
+# image_root: ann['image'] paths are relative to this (defaults to ../../datasets).
+image_root: '../../datasets'
+# ~41.6k train samples (matches the VLM cache built with --dataset-division 5).
+dataset_division: 5
+
+# ---- text encoder: BERT (the baseline this experiment compares against) ----
+text_backbone: bert
+text_config: 'configs/config_bert.json'
+# text_lowercase auto-derives to true for bert.
+
+image_res: 256
+vision_width: 768
+embed_dim: 256
+batch_size_train: 16        # 65536 % batch_size_train must be 0 (MoCo queue)
+batch_size_val: 64
+accum_steps: 2
+amp: true
+amp_dtype: bf16
+eval_interval: 2
+temp: 0.07
+queue_size: 65536
+momentum: 0.995
+alpha: 0.4
+max_words: 50               # MUST match the VLM cache build
+label_smoothing: 0.0
+
+# ---- original HAMMER loss weights (unchanged) ----
+loss_MAC_wgt: 0.1
+loss_BIC_wgt: 1
+loss_bbox_wgt: 0.1
+loss_giou_wgt: 0.1
+loss_TMG_wgt: 1
+loss_MLC_wgt: 1
+
+# ---- VLM distillation ----
+vlm_distill: true
+vlm_cache_file: "vlm_cache/qwen25_3b_train_div5.jsonl"
+loss_vlm_bic_wgt: 0.00      # binary KL: off initially (Qwen is semantic, can fight forensic labels)
+loss_vlm_mlc_wgt: 0.05      # multi-label distillation (restricted to TS/TA below)
+loss_vlm_tmg_wgt: 0.10      # token grounding distillation
+loss_vlm_bbox_wgt: 0.00     # not implemented / intentionally disabled
+vlm_teacher_temperature: 1.0
+vlm_mlc_use_classes: ["text_swap", "text_attribute"]
+
+optimizer: {opt: adamW, lr: 2e-5, lr_img: 1e-4, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 2e-5, epochs: 20, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 4, cooldown_epochs: 0}

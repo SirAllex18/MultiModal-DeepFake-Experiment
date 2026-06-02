@@ -1,0 +1,51 @@
+# Experiment E1 — HAMMER + VLM TS/TA multi-label distillation ONLY.
+#
+# Identical to configs/train_vlm_distill.yaml (E2) except token distillation is
+# off (loss_vlm_tmg_wgt: 0.0). Isolates the contribution of multi-label (TS/TA)
+# distillation from token-grounding distillation.
+#
+# Requires the same VLM cache as E2. Run with: --text_encoder bert-base-uncased
+
+train_file: ["../../datasets/DGM4/metadata/train.json"]
+val_file: ["../../datasets/DGM4/metadata/val.json"]
+image_root: '../../datasets'
+dataset_division: 5
+
+text_backbone: bert
+text_config: 'configs/config_bert.json'
+
+image_res: 256
+vision_width: 768
+embed_dim: 256
+batch_size_train: 16
+batch_size_val: 64
+accum_steps: 2
+amp: true
+amp_dtype: bf16
+eval_interval: 2
+temp: 0.07
+queue_size: 65536
+momentum: 0.995
+alpha: 0.4
+max_words: 50
+label_smoothing: 0.0
+
+loss_MAC_wgt: 0.1
+loss_BIC_wgt: 1
+loss_bbox_wgt: 0.1
+loss_giou_wgt: 0.1
+loss_TMG_wgt: 1
+loss_MLC_wgt: 1
+
+# ---- VLM distillation: multi-label only (token distillation OFF) ----
+vlm_distill: true
+vlm_cache_file: "vlm_cache/qwen25_3b_train_div5.jsonl"
+loss_vlm_bic_wgt: 0.00
+loss_vlm_mlc_wgt: 0.05
+loss_vlm_tmg_wgt: 0.00      # <-- the only change vs E2
+loss_vlm_bbox_wgt: 0.00
+vlm_teacher_temperature: 1.0
+vlm_mlc_use_classes: ["text_swap", "text_attribute"]
+
+optimizer: {opt: adamW, lr: 2e-5, lr_img: 1e-4, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 2e-5, epochs: 20, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 4, cooldown_epochs: 0}

@@ -1,0 +1,50 @@
+# Experiment E0 — matched BERT baseline (NO VLM).
+#
+# This is the controlled baseline for the VLM comparison. It is IDENTICAL to
+# configs/train_vlm_distill.yaml (E2) except it disables VLM distillation, so
+# E0 vs E1 vs E2 differ ONLY in the VLM loss terms. Do NOT compare against
+# results_all_bert.txt (unknown training provenance) — run this instead.
+#
+# Differs from train_vlm_distill.yaml ONLY in: vlm_distill (false) and the
+# loss_vlm_*_wgt weights (all 0). Same seed/split/schedule/init/eval.
+# Run with: --text_encoder bert-base-uncased
+
+train_file: ["../../datasets/DGM4/metadata/train.json"]
+val_file: ["../../datasets/DGM4/metadata/val.json"]
+image_root: '../../datasets'
+dataset_division: 5
+
+text_backbone: bert
+text_config: 'configs/config_bert.json'
+
+image_res: 256
+vision_width: 768
+embed_dim: 256
+batch_size_train: 16
+batch_size_val: 64
+accum_steps: 2
+amp: true
+amp_dtype: bf16
+eval_interval: 2
+temp: 0.07
+queue_size: 65536
+momentum: 0.995
+alpha: 0.4
+max_words: 50
+label_smoothing: 0.0
+
+loss_MAC_wgt: 0.1
+loss_BIC_wgt: 1
+loss_bbox_wgt: 0.1
+loss_giou_wgt: 0.1
+loss_TMG_wgt: 1
+loss_MLC_wgt: 1
+
+# ---- VLM distillation DISABLED (this is the baseline) ----
+vlm_distill: false
+loss_vlm_bic_wgt: 0.00
+loss_vlm_mlc_wgt: 0.00
+loss_vlm_tmg_wgt: 0.00
+
+optimizer: {opt: adamW, lr: 2e-5, lr_img: 1e-4, weight_decay: 0.02}
+schedular: {sched: cosine, lr: 2e-5, epochs: 20, min_lr: 1e-6, decay_rate: 1, warmup_lr: 1e-6, warmup_epochs: 4, cooldown_epochs: 0}
