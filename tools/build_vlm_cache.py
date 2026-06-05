@@ -51,7 +51,7 @@ from dataset.vlm_cache import MANIP_CLASSES, PROMPT_VERSION, hash_caption  # noq
 # --------------------------------------------------------------------------- #
 # Prompt
 # --------------------------------------------------------------------------- #
-PROMPT_HEADER = """You are an expert news fact-checker. You are given a news photograph and its caption. Decide whether specific WORDS in the caption are directly contradicted by what the photograph actually shows.
+PROMPT_HEADER = """You are an expert news fact-checker. You are given a news photograph and its caption. Decide whether the CAPTION has been edited so that it no longer matches what the photograph actually shows.
 
 Caption:
 "{caption}"
@@ -59,18 +59,18 @@ Caption:
 Numbered caption words:
 {numbered_words}
 
-Decision rules (read carefully):
-- DEFAULT TO GENUINE. Real news captions are the common case. Report a problem ONLY when the image shows something that DIRECTLY conflicts with a specific word. Absence of visual confirmation is NOT a contradiction.
-- You CANNOT identify specific named individuals, organisations, dates, or places from a photo. Treat all names / dates / places as CORRECT. Never flag a name, and never use "these may not be the named people" as evidence.
-- Judge ONLY depictable scene content: actions, objects, setting type (indoor / outdoor / court / stadium / ...), number of people, and clearly visible emotions or attributes.
-- Two edit types to look for:
-  - text_swap: a depictable action / object / setting / event / count word stated in the caption is clearly contradicted by the image.
-  - text_attribute: a sentiment / emotion / attribute word (happy, angry, celebrating, injured, destroyed, crowded, ...) that clearly conflicts with what is visible.
+How to judge:
+- Use ONLY what is visibly depicted in the photograph.
+- Do NOT penalize names, places, or dates you cannot personally verify. Assume the named people / places / dates may be correct UNLESS the visible content clearly contradicts them. You are not verifying identities; you are checking whether the visible scene matches the words.
+- You are looking for two kinds of TEXT edit:
+  - text_swap: a concrete, depictable element (an action, object, setting/place type, event, count, or the people's visible activity) stated in the caption is clearly contradicted by the image.
+  - text_attribute: a sentiment / emotion / attribute word (e.g. happy, angry, celebrating, mourning, injured, destroyed, crowded) that clearly conflicts with the mood or attributes visible in the image.
+- Flag a word ONLY when the image gives POSITIVE visual evidence that it is wrong. If the image neither supports nor contradicts a word, do NOT flag it. Genuine captions are common; flagging every word is incorrect.
 
-Calibration (important):
-- If the image is plausibly consistent with the caption (even if you cannot confirm every detail): set fake_probability <= 0.15, text_swap <= 0.15, text_attribute <= 0.15, and return an EMPTY unsupported_word_indices list.
-- Set a probability above 0.5 ONLY when there is a clear, specific visual contradiction.
-- unsupported_word_indices must contain ONLY the directly contradicted words - typically 0, sometimes 1-3. NEVER list most or all of the words.
+Scoring:
+- text_swap / text_attribute: probability (0..1) that an edit of that type is present, based only on visible contradiction.
+- fake_probability: overall probability (0..1) that the caption misrepresents the image.
+- word_scores: for each flagged index, your confidence (0..1) that THAT specific word is contradicted by the image. Omit words you cannot judge.
 
 Return STRICT JSON ONLY, no prose, with exactly this schema:
 {{
@@ -79,9 +79,9 @@ Return STRICT JSON ONLY, no prose, with exactly this schema:
     "text_swap": <float 0..1>,
     "text_attribute": <float 0..1>
   }},
-  "unsupported_word_indices": [<int indices of directly contradicted words, usually 0-3>],
+  "unsupported_word_indices": [<int indices of specifically contradicted words>],
   "word_scores": {{"<word index>": <float 0..1>}},
-  "rationale": "<one concise sentence citing the specific visual contradiction, or 'consistent'>"
+  "rationale": "<one concise sentence citing the visual evidence>"
 }}"""
 
 

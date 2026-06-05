@@ -39,7 +39,7 @@ loss_MLC_wgt: 1
 
 # ---- VLM distillation: multi-label only (token distillation OFF) ----
 vlm_distill: true
-vlm_cache_file: "vlm_cache/qwen25_3b_train_div5.jsonl"
+vlm_cache_file: "vlm_cache/qwen25_7b_train_div5.calib.jsonl"
 loss_vlm_bic_wgt: 0.00
 loss_vlm_mlc_wgt: 0.05
 loss_vlm_tmg_wgt: 0.00      # <-- the only change vs E2

@@ -32,7 +32,7 @@ MANIP_CLASSES = ("face_swap", "face_attribute", "text_swap", "text_attribute")
 # Bump when the prompt or the JSON schema changes in a way that invalidates
 # previously generated records. Stored per-record so a cache built with an old
 # prompt can be detected and regenerated.
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v2"
 
 
 def hash_caption(prompt_caption: str) -> str:

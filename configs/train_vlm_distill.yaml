@@ -50,7 +50,7 @@ loss_MLC_wgt: 1
 
 # ---- VLM distillation ----
 vlm_distill: true
-vlm_cache_file: "vlm_cache/qwen25_3b_train_div5.jsonl"
+vlm_cache_file: "vlm_cache/qwen25_7b_train_div5.calib.jsonl"
 loss_vlm_bic_wgt: 0.00      # binary KL: off initially (Qwen is semantic, can fight forensic labels)
 loss_vlm_mlc_wgt: 0.05      # multi-label distillation (restricted to TS/TA below)
 loss_vlm_tmg_wgt: 0.10      # token grounding distillation
