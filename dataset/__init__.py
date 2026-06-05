@@ -3,8 +3,17 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from PIL import Image
 
-from dataset.dataset import DGM4_Dataset
-from dataset.randaugment import RandomAugment
+try:
+    from dataset.dataset import DGM4_Dataset
+    from dataset.randaugment import RandomAugment
+except ModuleNotFoundError:
+    # The offline VLM cache builder (tools/build_vlm_cache.py) runs in the
+    # minimal Qwen env and imports only the lightweight helpers (dataset.utils,
+    # dataset.vlm_cache). Importing those triggers this package __init__, which
+    # otherwise forces the full vision stack (e.g. cv2 via randaugment). The only
+    # consumer of these names is create_dataset(), which that env never calls.
+    DGM4_Dataset = None
+    RandomAugment = None
 
 def create_dataset(config):
     
