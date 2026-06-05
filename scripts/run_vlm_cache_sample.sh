@@ -17,7 +17,7 @@ set -e
 DATA_ROOT="../../datasets"
 META="${DATA_ROOT}/DGM4/metadata/train.json"
 MODEL="Qwen/Qwen2.5-VL-7B-Instruct"
-SAMPLE_OUT="vlm_cache/qwen25_7b_sample.jsonl"
+SAMPLE_OUT="vlm_cache/qwen25_7b_v3_sample.jsonl"
 
 mkdir -p vlm_cache
 
