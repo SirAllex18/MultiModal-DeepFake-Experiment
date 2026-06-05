@@ -51,7 +51,7 @@ from dataset.vlm_cache import MANIP_CLASSES, PROMPT_VERSION, hash_caption  # noq
 # --------------------------------------------------------------------------- #
 # Prompt
 # --------------------------------------------------------------------------- #
-PROMPT_HEADER = """You are analyzing a news image and its accompanying caption.
+PROMPT_HEADER = """You are an expert news fact-checker. You are given a news photograph and its caption. Decide whether the CAPTION has been edited so that it no longer matches what the photograph actually shows.
 
 Caption:
 "{caption}"
@@ -59,23 +59,29 @@ Caption:
 Numbered caption words:
 {numbered_words}
 
-Task:
-Determine whether the image and caption are semantically consistent.
-Look for unsupported people, actions, attributes, objects, places, events, or sentiment.
-Return the word indices for caption words that are NOT visually supported by the image.
+How to judge:
+- Use ONLY what is visibly depicted in the photograph.
+- Do NOT penalize names, places, or dates you cannot personally verify. Assume the named people / places / dates may be correct UNLESS the visible content clearly contradicts them. You are not verifying identities; you are checking whether the visible scene matches the words.
+- You are looking for two kinds of TEXT edit:
+  - text_swap: a concrete, depictable element (an action, object, setting/place type, event, count, or the people's visible activity) stated in the caption is clearly contradicted by the image.
+  - text_attribute: a sentiment / emotion / attribute word (e.g. happy, angry, celebrating, mourning, injured, destroyed, crowded) that clearly conflicts with the mood or attributes visible in the image.
+- Flag a word ONLY when the image gives POSITIVE visual evidence that it is wrong. If the image neither supports nor contradicts a word, do NOT flag it. Genuine captions are common; flagging every word is incorrect.
+
+Scoring:
+- text_swap / text_attribute: probability (0..1) that an edit of that type is present, based only on visible contradiction.
+- fake_probability: overall probability (0..1) that the caption misrepresents the image.
+- word_scores: for each flagged index, your confidence (0..1) that THAT specific word is contradicted by the image. Omit words you cannot judge.
 
 Return STRICT JSON ONLY, no prose, with exactly this schema:
 {{
   "fake_probability": <float 0..1>,
   "manipulation_probs": {{
-    "face_swap": <float 0..1>,
-    "face_attribute": <float 0..1>,
     "text_swap": <float 0..1>,
     "text_attribute": <float 0..1>
   }},
-  "unsupported_word_indices": [<int word indices>],
+  "unsupported_word_indices": [<int indices of specifically contradicted words>],
   "word_scores": {{"<word index>": <float 0..1>}},
-  "rationale": "<one concise sentence>"
+  "rationale": "<one concise sentence citing the visual evidence>"
 }}"""
 
 
